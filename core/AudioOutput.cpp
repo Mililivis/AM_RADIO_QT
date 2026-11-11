@@ -9,6 +9,9 @@
 #include <unistd.h>
 #include <vector>
 
+namespace core
+{
+
 namespace
 {
 constexpr unsigned chunkMs = 20;
@@ -184,3 +187,5 @@ bool AudioOutput::write(const int16_t *data, size_t count)
     }
     return true;
 }
+
+} // namespace core

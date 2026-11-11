@@ -3,5 +3,5 @@
 set -euo pipefail
 PI="${PI:-mililivis@10.42.0.221}"
 
-rsync -az --delete --exclude build/ --exclude .git/ ~/AM_RADIO_QT "$PI":~/
+rsync -az --delete --exclude build/ --exclude .git/ --exclude '*.wav' ~/AM_RADIO_QT "$PI":~/
 ssh "$PI" 'cd ~/AM_RADIO_QT && cmake -B build -DCMAKE_BUILD_TYPE=Release >/dev/null && cmake --build build -j4'

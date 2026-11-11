@@ -1,22 +1,25 @@
 #include "Scanner.h"
 
-#include "Dsp.h"
 #include "RtlSdrDriver.h"
+#include "dsp/Fft.h"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
+
+namespace core
+{
 
 namespace
 {
 
 constexpr uint32_t scanRate = 2'048'000;
 constexpr size_t fftSize = 4096;                 // 500 Hz bins
-constexpr size_t averages = 96;                  // ~190 ms of signal per window
+constexpr size_t hop = fftSize / 4;              // 75 % overlap
 constexpr size_t settleSamples = 65536;          // dropped after retune (PLL + AGC settle)
 constexpr double usableHalf = 0.4 * scanRate;    // ±819 kHz around window centre
-constexpr double dcGuard = 6e3;                  // ignore DC spike
-constexpr double margin = 20e3;                  // extra spectrum shown around band
+constexpr double dcGuard = 6e3;                  // DC spike excluded, covered by neighbour window
+constexpr double margin = 20e3;                  // extra spectrum shown around the range
 
 constexpr double carrierSearchHz = 1e3;          // carrier may be slightly off grid
 constexpr double floorWindowHz = 100e3;          // noise floor estimated in ±100 kHz
@@ -25,24 +28,22 @@ constexpr double sidebandFromHz = 2e3;
 constexpr double sidebandToHz = 4e3;
 constexpr float minCarrierOverSidebandsDb = 3.0f;
 
-const float noData = std::numeric_limits<float>::quiet_NaN();
-
-std::vector<double> windowCentres(double gridStart, double gridStop, double bin)
+std::vector<double> windowCentres(double firstBin, double lastBin, double bin)
 {
     const double step = std::floor(0.85 * usableHalf / bin) * bin;
     std::vector<double> centres;
 
-    double c = std::round((gridStart + usableHalf) / bin) * bin;
+    double c = std::round((firstBin + usableHalf) / bin) * bin;
     centres.push_back(c);
 
-    // Whole band fits into the left half of the first window
-    if (gridStop <= c - dcGuard)
+    // Whole range fits into the left half of the first window
+    if (lastBin <= c - dcGuard)
     {
         return centres;
     }
 
     // Every next window covers DC of the previous one with its left half
-    while (centres.back() + usableHalf < gridStop || centres.size() < 2)
+    while (centres.back() + usableHalf < lastBin || centres.size() < 2)
     {
         centres.push_back(centres.back() + step);
     }
@@ -56,29 +57,34 @@ ScanResult runScan(sdr::RtlSdrDriver &dev, const ScanParams &params,
 {
     const double bin = static_cast<double>(scanRate) / fftSize;
 
+    // Output grid: bin i is centred at firstBin + i*bin
+    const double firstBin = std::max(bin, std::floor((params.startHz - margin) / bin) * bin);
+    const double lastBin = params.stopHz + margin;
+    const size_t nBins = static_cast<size_t>((lastBin - firstBin) / bin) + 1;
+
     ScanResult result;
     result.binHz = bin;
-    result.startHz = std::max(0.0, std::floor((params.startHz - margin) / bin) * bin);
-    const double gridStop = params.stopHz + margin;
-    const size_t nBins = static_cast<size_t>((gridStop - result.startHz) / bin) + 1;
+    result.startHz = firstBin - bin / 2.0;
+    result.gridHz = params.gridHz;
 
     std::vector<double> sum(nBins, 0.0);
     std::vector<uint32_t> count(nBins, 0);
 
     const std::vector<float> window = dsp::blackmanHarris(fftSize);
-    double windowSum = 0.0;
+    double sumSquares = 0.0;
     for (float w : window)
     {
-        windowSum += w;
+        sumSquares += static_cast<double>(w) * w;
     }
-    // full-scale complex tone -> 0 dB
-    const double norm = 1.0 / (windowSum * windowSum);
+    const double norm = 1.0 / (static_cast<double>(fftSize) * sumSquares);   // power-conserving
 
     dev.setSampleRate(scanRate);
 
-    const std::vector<double> centres = windowCentres(result.startHz, gridStop, bin);
+    dsp::Fft fft(fftSize);
+    const std::vector<double> centres = windowCentres(firstBin, lastBin, bin);
     std::vector<dsp::cf> frame(fftSize);
     std::vector<double> power(fftSize);
+    const size_t samplesPerWindow = fftSize + hop * (std::max(1u, params.averages) - 1);
 
     for (size_t w = 0; w < centres.size() && !abort; ++w)
     {
@@ -87,21 +93,22 @@ ScanResult runScan(sdr::RtlSdrDriver &dev, const ScanParams &params,
         dev.resetBuffer();
         dev.readIq(settleSamples);
 
-        std::vector<sdr::IqSample> iq = dev.readIq(fftSize * averages);
+        std::vector<sdr::IqSample> iq = dev.readIq(samplesPerWindow);
         std::fill(power.begin(), power.end(), 0.0);
-        size_t frames = iq.size() / fftSize;
+        size_t frames = 0;
 
-        for (size_t f = 0; f < frames; ++f)
+        for (size_t pos = 0; pos + fftSize <= iq.size(); pos += hop)
         {
             for (size_t i = 0; i < fftSize; ++i)
             {
-                frame[i] = iq[f * fftSize + i] * window[i];
+                frame[i] = iq[pos + i] * window[i];
             }
-            dsp::fft(frame);
+            fft.forward(frame);
             for (size_t i = 0; i < fftSize; ++i)
             {
                 power[i] += std::norm(frame[i]);
             }
+            ++frames;
         }
 
         if (frames > 0)
@@ -114,7 +121,7 @@ ScanResult runScan(sdr::RtlSdrDriver &dev, const ScanParams &params,
                 {
                     continue;
                 }
-                long idx = std::lround((centre + offset - result.startHz) / bin);
+                long idx = std::lround((centre + offset - firstBin) / bin);
                 if (idx < 0 || static_cast<size_t>(idx) >= nBins)
                 {
                     continue;
@@ -130,11 +137,11 @@ ScanResult runScan(sdr::RtlSdrDriver &dev, const ScanParams &params,
         }
     }
 
-    result.spectrumDb.resize(nBins);
+    result.power.resize(nBins);
     for (size_t i = 0; i < nBins; ++i)
     {
-        result.spectrumDb[i] = count[i] ? static_cast<float>(10.0 * std::log10(sum[i] / count[i] + 1e-20))
-                                        : noData;
+        result.power[i] = count[i] ? static_cast<float>(sum[i] / count[i])
+                                   : std::numeric_limits<float>::quiet_NaN();
     }
 
     result.stations = detectStations(result, params);
@@ -144,13 +151,20 @@ ScanResult runScan(sdr::RtlSdrDriver &dev, const ScanParams &params,
 std::vector<Station> detectStations(const ScanResult &spectrum, const ScanParams &params)
 {
     std::vector<Station> stations;
-    const auto &db = spectrum.spectrumDb;
-    if (db.empty() || spectrum.binHz <= 0.0 || params.gridHz <= 0.0)
+    if (spectrum.power.empty() || spectrum.binHz <= 0.0 || params.gridHz <= 0.0)
     {
         return stations;
     }
 
+    std::vector<float> db(spectrum.power.size());
+    for (size_t i = 0; i < db.size(); ++i)
+    {
+        float p = spectrum.power[i];
+        db[i] = std::isnan(p) ? p : static_cast<float>(10.0 * std::log10(p + 1e-20));
+    }
+
     const double bin = spectrum.binHz;
+    const double firstBin = spectrum.startHz + bin / 2.0;
     const long n = static_cast<long>(db.size());
     const long searchBins = std::lround(carrierSearchHz / bin);
     const long floorBins = std::lround(floorWindowHz / bin);
@@ -164,7 +178,7 @@ std::vector<Station> detectStations(const ScanResult &spectrum, const ScanParams
 
     for (double f = first; f <= params.stopHz + 1e-6; f += params.gridHz)
     {
-        long ci = std::lround((f - spectrum.startHz) / bin);
+        long ci = std::lround((f - firstBin) / bin);
 
         // Carrier = strongest bin near the grid frequency
         float carrier = -std::numeric_limits<float>::infinity();
@@ -224,3 +238,5 @@ std::vector<Station> detectStations(const ScanResult &spectrum, const ScanParams
 
     return stations;
 }
+
+} // namespace core

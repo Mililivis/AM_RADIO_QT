@@ -11,6 +11,9 @@
 
 struct pa_simple;
 
+namespace core
+{
+
 /// @brief mono 16-bit audio sink with its own thread and jitter buffer
 ///
 /// Backends:
@@ -64,5 +67,7 @@ private:
     std::deque<int16_t> queue_;
     bool starved_ = true;
 };
+
+} // namespace core
 
 #endif
